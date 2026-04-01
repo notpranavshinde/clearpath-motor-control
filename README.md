@@ -1,40 +1,79 @@
 # ClearPath Motor Control
 
-This project provides an Arduino sketch to control a ClearPath SDSK motor for linear motion with velocity ramping. It allows you to specify a target speed, distance, and acceleration to move a load linearly.
+This repository contains multiple Step/Dir control paths for a ClearPath SDSK linear drive setup:
 
-## Features
+1. Arduino sketches for standalone motion control with AccelStepper.
+2. A Python + NI-DAQmx controller for hardware pulse generation on NI USB-6341.
 
-*   Controls a ClearPath motor using Step/Direction signals.
-*   Implements trapezoidal velocity profiling (ramp-up, cruise, ramp-down).
-*   Configurable speed, distance, and acceleration in metric units.
-*   Calculates and displays move parameters in both metric and imperial units.
-*   Serial interface to trigger the motor movement.
+## Repository Layout
 
-## How to Use
+- `arduino motor control/clearpath_motor_velocity_ramp_up_and_down.ino`
+    - Baseline Arduino sketch with metric input constants.
+    - Runs one trapezoidal move per Enter keypress in Serial Monitor.
+- `arduino motor control/clearpath_motor_velocity_ramp_up_and_down_debug.ino`
+    - Debug-oriented Arduino sketch.
+    - Prints requested vs achievable motion (planner limits and actual measured move timing).
+- `arduino motor control/clearpath_motor_velocity_ramp_up_and_down_final_with_ui.ino`
+    - Interactive runtime UI over Serial.
+    - Lets you enter distance/speed/acceleration and optional round-trip loops at runtime.
+- `daq_motor_control/clearpath_6341_stepdir.py`
+    - NI-DAQ based controller using counter pulse output (step) + digital lines (dir/enable).
+    - Supports both constant-velocity moves and segmented trapezoid/triangle moves.
 
-1.  **Hardware Setup:**
-    *   Connect the ClearPath motor to your Arduino as follows:
-        *   `STEP+` (Black)  -> Arduino Pin 2
-        *   `DIR+`  (White)  -> Arduino Pin 3
-        *   `EN+`   (Blue)   -> Arduino Pin 4 (in series with a toggle switch)
-        *   `STEP-`/`DIR-`/`EN-` -> Arduino GND
-    *   The toggle switch on the `EN+` line is used to enable/disable the motor.
+## Hardware Wiring (Step/Dir/Enable)
 
-2.  **Software Setup:**
-    *   Open the `.ino` sketch file in the Arduino IDE.
-    *   Install the `AccelStepper` library. You can find it in the Arduino Library Manager.
-    *   Modify the following constants in the code to match your desired movement profile:
-        *   `SPEED_M_S`: The desired linear speed in meters per second.
-        *   `DIST_M`: The desired linear distance in meters. A negative value will reverse the direction.
-        *   `ACCEL_M_S2`: The desired linear acceleration in meters per second squared.
+Common signal mapping used across the code:
 
-3.  **Running the Code:**
-    *   Upload the sketch to your Arduino. **Keep the motor enable switch OPEN during the upload.**
-    *   Open the Serial Monitor at 115200 baud.
-    *   Close the enable switch to power the motor.
-    *   Press Enter in the Serial Monitor to trigger the movement.
+- `STEP+` (black) -> pulse output (`D2` on Arduino variants, counter output on NI-DAQ script)
+- `DIR+` (white) -> direction line (`D3` on Arduino, DO line on NI-DAQ)
+- `EN+` (blue) -> enable line (`D4` on Arduino, DO line on NI-DAQ)
+- `STEP-`, `DIR-`, `EN-` -> controller ground
 
-## Dependencies
+Important: keep the physical enable switch open/disabled while flashing firmware.
 
-*   [AccelStepper Library](https://www.airspayce.com/mikem/arduino/AccelStepper/)
+## Arduino Workflow
+
+1. Open one of the `.ino` files in Arduino IDE.
+2. Install `AccelStepper` from Library Manager.
+3. Upload to the board with motor enable open.
+4. Open Serial Monitor at `115200` baud.
+5. Close enable switch and follow each sketch's prompts.
+
+### Arduino Dependencies
+
+- [AccelStepper](https://www.airspayce.com/mikem/arduino/AccelStepper/)
+
+## NI-DAQ Python Workflow
+
+The Python script is intended for NI USB-6341 style hardware and uses `nidaqmx` tasks for:
+
+- Finite pulse trains on counter output for step pulses.
+- Digital output lines for direction and enable.
+
+### Python Setup
+
+1. Install NI-DAQmx driver from National Instruments.
+2. Install Python dependencies:
+
+```bash
+pip install nidaqmx
+```
+
+3. Run:
+
+```bash
+python daq_motor_control/clearpath_6341_stepdir.py
+```
+
+4. Enter distance, speed, profile mode, and optional loop settings when prompted.
+
+## Safety and Operating Notes
+
+The current code includes software guardrails to reduce mechanical risk:
+
+- Distance clamp around `2.5 m` maximum travel.
+- Acceleration guard near `10 m/s^2` upper bound.
+- Speed limits based on controller/mechanics constraints.
+
+Tune values conservatively and increase gradually during commissioning.
 
