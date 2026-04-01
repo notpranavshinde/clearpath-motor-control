@@ -37,11 +37,30 @@ def pick_device_name() -> str:
     devs = list(System.local().devices)
     if not devs:
         raise RuntimeError("No NI-DAQ device found. Check NI-DAQmx install + USB connection.")
-    # Prefer Dev1 if present
-    for d in devs:
+
+    if len(devs) == 1:
+        return devs[0].name
+
+    default_idx = 0
+    for i, d in enumerate(devs):
         if d.name.lower() == "dev1":
-            return d.name
-    return devs[0].name
+            default_idx = i
+            break
+
+    print("\nMultiple NI-DAQ devices detected:")
+    for i, d in enumerate(devs, start=1):
+        default_tag = " (default)" if (i - 1) == default_idx else ""
+        print(f"  {i}. {d.name}{default_tag}")
+
+    while True:
+        choice = input(f"Select device [1-{len(devs)}] (Enter for default): ").strip()
+        if choice == "":
+            return devs[default_idx].name
+        if choice.isdigit():
+            idx = int(choice) - 1
+            if 0 <= idx < len(devs):
+                return devs[idx].name
+        print("Invalid selection. Please enter a valid device number.")
 
 
 def set_dir_en(ch: Channels, direction: int, enable: int) -> None:
