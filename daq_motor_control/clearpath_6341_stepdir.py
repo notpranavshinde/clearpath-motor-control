@@ -1,3 +1,4 @@
+import os
 import math
 import time
 from dataclasses import dataclass
@@ -5,6 +6,11 @@ from dataclasses import dataclass
 import nidaqmx
 from nidaqmx.constants import AcquisitionType, FrequencyUnits, Level
 from nidaqmx.system import System
+
+try:
+    import msvcrt
+except ImportError:
+    msvcrt = None
 
 
 # ----------------------------
@@ -22,6 +28,10 @@ D_SAFE_MAX_M = 2.50     # m (avoid wave generator clash)
 A_SAFE_MAX = 10.0       # m/s^2 (belt slip risk above this; ~5 is comfy)
 V_SAFE_MAX = 3.0        # m/s (software guard; DAQ can do more, mechanics may not)
 V_MIN = 0.01            # m/s (avoid silly low)
+
+
+class AbortRequested(Exception):
+    pass
 
 
 @dataclass
@@ -63,6 +73,110 @@ def pick_device_name() -> str:
         print("Invalid selection. Please enter a valid device number.")
 
 
+def poll_escape_key() -> bool:
+    if msvcrt is None or os.name != "nt":
+        return False
+
+    escaped = False
+    while msvcrt.kbhit():
+        key = msvcrt.getwch()
+        if key == "\x1b":
+            escaped = True
+        elif key in ("\x00", "\xe0"):
+            # Consume the extended key code so it does not leak into later prompts.
+            if msvcrt.kbhit():
+                msvcrt.getwch()
+    return escaped
+
+
+def raise_if_aborted() -> None:
+    if poll_escape_key():
+        raise AbortRequested("Esc pressed")
+
+
+def sleep_with_abort(seconds: float, step: float = 0.05) -> None:
+    remaining = max(0.0, seconds)
+    while remaining > 0:
+        raise_if_aborted()
+        chunk = min(step, remaining)
+        time.sleep(chunk)
+        remaining -= chunk
+
+
+def read_console_line(prompt: str, default: str | None = None) -> str:
+    if msvcrt is None or os.name != "nt":
+        line = input(prompt)
+        if line == "" and default is not None:
+            return default
+        return line
+
+    print(prompt, end="", flush=True)
+    buffer: list[str] = []
+
+    while True:
+        raise_if_aborted()
+        char = msvcrt.getwch()
+
+        if char in ("\r", "\n"):
+            print()
+            text = "".join(buffer).strip()
+            return default if text == "" and default is not None else text
+
+        if char == "\x1b":
+            raise AbortRequested("Esc pressed")
+
+        if char == "\b":
+            if buffer:
+                buffer.pop()
+                print("\b \b", end="", flush=True)
+            continue
+
+        if char in ("\x00", "\xe0"):
+            # Consume the extended key code.
+            if msvcrt.kbhit():
+                msvcrt.getwch()
+            continue
+
+        buffer.append(char)
+        print(char, end="", flush=True)
+
+
+def prompt_float(prompt: str, default: float) -> float:
+    while True:
+        text = read_console_line(f"{prompt} [{default:.4f}]: ", default=str(default))
+        try:
+            return float(text)
+        except ValueError:
+            print("  (bad number, try again)")
+
+
+def prompt_int(prompt: str, default: int, min_val: int, max_val: int) -> int:
+    while True:
+        text = read_console_line(f"{prompt} [{default}]: ", default=str(default))
+        try:
+            value = int(text)
+        except ValueError:
+            print("  (bad integer, try again)")
+            continue
+
+        if value < min_val:
+            value = min_val
+        if value > max_val:
+            value = max_val
+        return value
+
+
+def prompt_yes_no(prompt: str, default: bool) -> bool:
+    suffix = "[Y]/n" if default else "y/[N]"
+    while True:
+        text = read_console_line(f"{prompt} {suffix}: ", default="y" if default else "n").strip().lower()
+        if text in ("y", "yes"):
+            return True
+        if text in ("n", "no"):
+            return False
+        print("  (please enter y or n)")
+
+
 def set_dir_en(ch: Channels, direction: int, enable: int) -> None:
     """Set DIR and EN with a single DO task."""
     with nidaqmx.Task() as t:
@@ -102,6 +216,67 @@ def run_pulse_train(ch: Channels, freq_hz: float, pulses: int, duty: float = 0.5
         timeout = max(2.0, (pulses / freq_hz) + 2.0)
         t.wait_until_done(timeout=timeout)
         t.stop()
+
+
+def run_pulse_train_abortable(
+    ch: Channels,
+    freq_hz: float,
+    pulses: int,
+    duty: float = 0.5,
+    poll_seconds: float = 0.1,
+) -> None:
+    if pulses <= 0:
+        return
+    if freq_hz <= 0:
+        raise ValueError("Frequency must be > 0")
+
+    task = nidaqmx.Task()
+    try:
+        co = task.co_channels.add_co_pulse_chan_freq(
+            counter=ch.step_ctr,
+            units=FrequencyUnits.HZ,
+            idle_state=Level.LOW,
+            initial_delay=0.0,
+            freq=freq_hz,
+            duty_cycle=duty,
+        )
+        # Force the output terminal (important; avoids routing surprises)
+        co.co_pulse_term = ch.step_out_term
+
+        task.timing.cfg_implicit_timing(
+            sample_mode=AcquisitionType.FINITE,
+            samps_per_chan=int(pulses),
+        )
+
+        task.start()
+        timeout = max(2.0, (pulses / freq_hz) + 2.0)
+        elapsed = 0.0
+
+        while elapsed < timeout:
+            raise_if_aborted()
+            remaining = min(poll_seconds, timeout - elapsed)
+            if remaining <= 0:
+                break
+            try:
+                task.wait_until_done(timeout=remaining)
+                break
+            except nidaqmx.errors.DaqError as exc:
+                message = str(exc).lower()
+                if "timeout" in message:
+                    elapsed += remaining
+                    continue
+                raise
+
+        raise_if_aborted()
+        task.stop()
+    except AbortRequested:
+        try:
+            task.stop()
+        except Exception:
+            pass
+        raise
+    finally:
+        task.close()
 
 
 def plan_trapezoid(distance_m: float, v_mps: float, a_mps2: float):
@@ -175,7 +350,13 @@ def constant_velocity_move(
     time.sleep(0.005)
 
     t0 = time.time()
-    run_pulse_train(ch, freq_hz=freq_hz, pulses=total_pulses, duty=0.5)
+    try:
+        run_pulse_train_abortable(ch, freq_hz=freq_hz, pulses=total_pulses, duty=0.5)
+    except AbortRequested:
+        set_dir_en(ch, direction=direction, enable=0)
+        print("\n[ABORT] Constant-velocity move stopped.")
+        return
+
     set_dir_en(ch, direction=direction, enable=0)
     t1 = time.time()
 
@@ -297,10 +478,15 @@ def segmented_move(
     time.sleep(0.005)
 
     t0 = time.time()
-    for (tag, f_hz), p in zip(segments, pulses_alloc):
-        if p <= 0:
-            continue
-        run_pulse_train(ch, freq_hz=f_hz, pulses=p, duty=0.5)
+    try:
+        for (tag, f_hz), p in zip(segments, pulses_alloc):
+            if p <= 0:
+                continue
+            run_pulse_train_abortable(ch, freq_hz=f_hz, pulses=p, duty=0.5)
+    except AbortRequested:
+        set_dir_en(ch, direction=direction, enable=0)
+        print("\n[ABORT] Segmented move stopped.")
+        return
 
     # disable
     set_dir_en(ch, direction=direction, enable=0)
@@ -330,24 +516,29 @@ def main():
     print(f"  distance <= {D_SAFE_MAX_M} m  (avoid wave generator)")
     print("  accel ~5 m/s^2 (safe), <=10 m/s^2 (slip risk)")
     print("  speed choose what you need; start <=1.0 m/s and work up")
+    print("  press Esc at any prompt or during a move to abort the current operation.")
     print("\nType values when prompted.\n")
 
     while True:
         try:
-            dist = float(input("Distance (m), sign sets direction (e.g. 0.8 or -0.8): ").strip())
-            spd  = float(input("Speed (m/s): ").strip())
+            raise_if_aborted()
 
-            mode = input("Profile: (c)onstant velocity or (t)rapezoid? [c/T]: ").strip().lower()
+            dist = prompt_float("Distance (m), sign sets direction (e.g. 0.8 or -0.8)", 0.8)
+            spd = prompt_float("Speed (m/s)", 0.5)
+
+            mode = read_console_line("Profile: (c)onstant velocity or (t)rapezoid? [c/T]: ", default="t").strip().lower()
             use_constant = mode == "c"
 
             acc = 0.0
             if not use_constant:
-                acc = float(input("Accel (m/s^2): ").strip())
+                acc = prompt_float("Accel (m/s^2)", 1.0)
 
-            do_loop = input("Loop 5 round-trips? (y/N): ").strip().lower() == "y"
+            do_loop = prompt_yes_no("Loop round-trips?", False)
+            round_trips = 5
             dwell = 0.0
             if do_loop:
-                dwell = float(input("Dwell between legs (s), e.g. 0.5: ").strip() or "0.0")
+                round_trips = prompt_int("Number of round-trips", 5, 1, 100)
+                dwell = prompt_float("Dwell between legs (s), e.g. 0.5", 0.5)
 
             if not do_loop:
                 if use_constant:
@@ -356,22 +547,25 @@ def main():
                     segmented_move(ch, dist, spd, acc, n_segments_acc=60, dwell_s=0.0)
             else:
                 d = abs(dist)
-                for k in range(5):
-                    print(f"\n=== Round-trip {k+1}/5 forward ===")
+                for k in range(round_trips):
+                    print(f"\n=== Round-trip {k+1}/{round_trips} forward ===")
                     if use_constant:
                         constant_velocity_move(ch, +d, spd, dwell_s=dwell)
                     else:
                         segmented_move(ch, +d, spd, acc, n_segments_acc=60, dwell_s=dwell)
-                    print(f"\n=== Round-trip {k+1}/5 back ===")
+                    print(f"\n=== Round-trip {k+1}/{round_trips} back ===")
                     if use_constant:
                         constant_velocity_move(ch, -d, spd, dwell_s=dwell)
                     else:
                         segmented_move(ch, -d, spd, acc, n_segments_acc=60, dwell_s=dwell)
 
-            again = input("\nRun another? (Y/n): ").strip().lower()
+            again = read_console_line("\nRun another? (Y/n): ", default="y").strip().lower()
             if again == "n":
                 break
 
+        except AbortRequested:
+            print("\n[ABORT] Operation cancelled.")
+            break
         except KeyboardInterrupt:
             print("\nStopping.")
             break
