@@ -519,26 +519,47 @@ def main():
     print("  press Esc at any prompt or during a move to abort the current operation.")
     print("\nType values when prompted.\n")
 
+    reuse_last_setup = False
+    last_setup = {}
+
     while True:
         try:
             raise_if_aborted()
 
-            dist = prompt_float("Distance (m), sign sets direction (e.g. 0.8 or -0.8)", 0.8)
-            spd = prompt_float("Speed (m/s)", 0.5)
+            if not reuse_last_setup:
+                dist = prompt_float("Distance (m), sign sets direction (e.g. 0.8 or -0.8)", 0.8)
+                mode = read_console_line("Profile: (c)onstant velocity or (t)rapezoid? [c/T]: ", default="t").strip().lower()
+                use_constant = mode == "c"
 
-            mode = read_console_line("Profile: (c)onstant velocity or (t)rapezoid? [c/T]: ", default="t").strip().lower()
-            use_constant = mode == "c"
+                acc = 0.0
+                if not use_constant:
+                    acc = prompt_float("Accel (m/s^2)", 1.0)
 
-            acc = 0.0
-            if not use_constant:
-                acc = prompt_float("Accel (m/s^2)", 1.0)
+                do_loop = prompt_yes_no("Loop round-trips?", False)
+                round_trips = 5
+                dwell = 0.0
+                if do_loop:
+                    round_trips = prompt_int("Number of round-trips", 5, 1, 100)
+                    dwell = prompt_float("Dwell between legs (s), e.g. 0.5", 0.5)
 
-            do_loop = prompt_yes_no("Loop round-trips?", False)
-            round_trips = 5
-            dwell = 0.0
-            if do_loop:
-                round_trips = prompt_int("Number of round-trips", 5, 1, 100)
-                dwell = prompt_float("Dwell between legs (s), e.g. 0.5", 0.5)
+                last_setup = {
+                    "dist": dist,
+                    "use_constant": use_constant,
+                    "acc": acc,
+                    "do_loop": do_loop,
+                    "round_trips": round_trips,
+                    "dwell": dwell,
+                }
+            else:
+                dist = last_setup["dist"]
+                use_constant = last_setup["use_constant"]
+                acc = last_setup["acc"]
+                do_loop = last_setup["do_loop"]
+                round_trips = last_setup["round_trips"]
+                dwell = last_setup["dwell"]
+
+            spd = prompt_float("Speed (m/s)", last_setup.get("spd", 0.5))
+            last_setup["spd"] = spd
 
             if not do_loop:
                 if use_constant:
@@ -559,9 +580,15 @@ def main():
                     else:
                         segmented_move(ch, -d, spd, acc, n_segments_acc=60, dwell_s=dwell)
 
-            again = read_console_line("\nRun another? (Y/n): ", default="y").strip().lower()
+            again = read_console_line(
+                "\nRun another? (Y = new setup, s = same setup/new speed, n = quit): ",
+                default="y",
+            ).strip().lower()
             if again == "n":
                 break
+            reuse_last_setup = again == "s"
+            if not reuse_last_setup:
+                last_setup = {}
 
         except AbortRequested:
             print("\n[ABORT] Operation cancelled.")
